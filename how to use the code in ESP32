@@ -7,7 +7,8 @@ https://raw.githubusercontent.com/ricardoquesada/esp32-arduino-lib-builder/maste
 
 after everything is downloaded paste the code in RC CAR CODE into the sketch
 
-INSTRUCTIONS
+          # INSTRUCTIONS #
+
 youll be needing a PS4 controller for this
 
 R2= throttle
@@ -20,3 +21,6 @@ triangle= low beams, high beams toggle
 circle= handbrake
 dpad up= double press for fog lights
 PS button= sport mode and normal mode
+
+when you hold down circle and then hold down fully R2 and set it to the highest gear, when you let go of circle the car launches
+in the future im planning on adding a drift function
