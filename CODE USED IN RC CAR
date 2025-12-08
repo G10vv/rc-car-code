@@ -1,0 +1,400 @@
+#include <Bluepad32.h>
+
+// ========================================================
+// CONFIG
+// ========================================================
+
+// Forward gear limits (0 = Neutral, 1–5 = gears)
+int gearPWMs[6] = {
+  0,    // Neutral
+  80,   // Gear 1
+  130,  // Gear 2
+  170,  // Gear 3
+  210,  // Gear 4
+  255   // Gear 5
+};
+
+// Reverse fixed speed
+const int reversePWM = 140;
+
+// Normal & Sport ramp values
+float rampUp_normal = 0.15;
+float rampDown_normal = 0.20;
+
+float rampUp_sport = 0.45;
+float rampDown_sport = 0.45;
+
+// ========================================================
+// PIN SETUP
+// ========================================================
+#define SPEAKER_PIN 32
+
+// L298N steering
+#define STEER_IN1 25
+#define STEER_IN2 33
+
+// BTS7960 drive
+#define R_PWM 26
+#define L_PWM 27
+#define R_EN 14
+#define L_EN 12
+
+// LEDs
+#define HEADLIGHT_PIN 2
+#define FOG_PIN 15
+#define BRAKE_PIN 5
+#define REVERSE_PIN 16
+
+// PWM levels
+int headlightLowPWM = 120;
+int headlightHighPWM = 255;
+int brakeLowPWM = 120;
+int brakeHighPWM = 255;
+
+// ========================================================
+// AUDIO
+// ========================================================
+void beep(int f, int d) {
+  tone(SPEAKER_PIN, f);
+  delay(d);
+  noTone(SPEAKER_PIN);
+  delay(20);
+}
+
+void playBoot() {
+  beep(900,150);
+  beep(1200,150);
+  beep(1500,200);
+}
+
+void playConnect() {
+  beep(1000,120);
+  beep(1600,140);
+}
+
+void playDisconnect() {
+  beep(1600,140);
+  beep(1000,120);
+}
+
+// ========================================================
+// VARIABLES
+// ========================================================
+GamepadPtr myGamepad;
+
+int gear = 0;
+bool lastUp = false;
+bool lastDown = false;
+
+bool sportMode = false;
+bool lastPS = false;
+
+float currentPWM = 0;
+float rampUp = 0.15;
+float rampDown = 0.20;
+
+// LED states
+bool headlightsOn = false;
+bool highBeams = false;
+bool fogOn = false;
+
+// fog double-press
+unsigned long lastDpadUpTime = 0;
+bool firstPress = false;
+bool lastDpadUpState = false;
+
+// flash high beams (R1)
+bool flashing = false;
+
+// sport LED pulse
+unsigned long lastPulseTime = 0;
+bool pulseIncreasing = true;
+int pulseValue = 0;
+
+// Brake release detection
+static bool wasPressingR2 = false;
+unsigned long brakeHoldUntil = 0;
+const unsigned long brakeHoldDuration = 200; // ms
+
+// ========================================================
+// CALLBACKS
+// ========================================================
+void onConnectedGamepad(GamepadPtr gp) {
+  myGamepad = gp;
+  Serial.println("Gamepad connected!");
+  playConnect();
+  gp->setColorLED(0, 0, 255);
+}
+
+void onDisconnectedGamepad(GamepadPtr gp) {
+  myGamepad = nullptr;
+  Serial.println("Gamepad disconnected!");
+  playDisconnect();
+}
+
+// ========================================================
+// SPORT MODE LED PULSING
+// ========================================================
+void updateSportLED(GamepadPtr gp) {
+  if (!sportMode) return;
+
+  unsigned long now = millis();
+  if (now - lastPulseTime > 15) {
+    lastPulseTime = now;
+
+    if (pulseIncreasing) {
+      pulseValue += 4;
+      if (pulseValue >= 255) {
+        pulseValue = 255;
+        pulseIncreasing = false;
+      }
+    } else {
+      pulseValue -= 4;
+      if (pulseValue <= 10) {
+        pulseValue = 10;
+        pulseIncreasing = true;
+      }
+    }
+
+    gp->setColorLED(pulseValue, 0, 0);
+  }
+}
+
+// ========================================================
+// STEERING
+// ========================================================
+void handleSteering(int axisX) {
+  int steer = map(axisX, -512, 512, -255, 255);
+
+  if (steer > 20) {
+    digitalWrite(STEER_IN1, HIGH);
+    digitalWrite(STEER_IN2, LOW);
+  }
+  else if (steer < -20) {
+    digitalWrite(STEER_IN1, LOW);
+    digitalWrite(STEER_IN2, HIGH);
+  }
+  else {
+    digitalWrite(STEER_IN1, LOW);
+    digitalWrite(STEER_IN2, LOW);
+  }
+}
+
+// ========================================================
+// HEADLIGHT / FOG / BRAKE / FLASH
+// ========================================================
+void handleLights(GamepadPtr gp) {
+  // TRIANGLE = toggle headlights
+  bool triangle = gp->buttons() & 0x0008;
+
+  static bool lastTriangle = false;
+  if (triangle && !lastTriangle) {
+    if (!headlightsOn) {
+      headlightsOn = true;
+      highBeams = false;
+    } else if (headlightsOn && !highBeams) {
+      highBeams = true;
+    } else {
+      headlightsOn = false;
+      highBeams = false;
+    }
+  }
+  lastTriangle = triangle;
+
+  // R1 = flash high beams (mask 0x0020)
+  bool r1 = gp->buttons() & 0x0020;
+  flashing = r1;
+
+  // DPAD UP double press (0x01)
+  bool dpadUp = (gp->dpad() & 0x01) != 0;
+  if (dpadUp && !lastDpadUpState) {
+    unsigned long now = millis();
+    if (!firstPress) {
+      firstPress = true;
+      lastDpadUpTime = now;
+    } else {
+      if (now - lastDpadUpTime < 350) {
+        fogOn = !fogOn;
+      }
+      firstPress = false;
+    }
+  }
+  if (firstPress && millis() - lastDpadUpTime > 350) {
+    firstPress = false;
+  }
+  lastDpadUpState = dpadUp;
+
+  // Headlights output
+  if (!headlightsOn)
+    analogWrite(HEADLIGHT_PIN, 0);
+  else if (flashing)
+    analogWrite(HEADLIGHT_PIN, headlightHighPWM);
+  else if (highBeams)
+    analogWrite(HEADLIGHT_PIN, headlightHighPWM);
+  else
+    analogWrite(HEADLIGHT_PIN, headlightLowPWM);
+
+  // Fog lights
+  analogWrite(FOG_PIN, fogOn ? 255 : 0);
+}
+
+// ========================================================
+// DRIVE SYSTEM
+// ========================================================
+void handleDrive(GamepadPtr gp) {
+
+
+  int forward = gp->throttle();  // L2 now forward
+  int reverse = gp->brake();     // R2 now reverse
+  // ------------------------------------------------------
+
+  int handbrake = gp->buttons() & 0x0002;
+
+  int targetPWM = 0;
+
+  // --- Reverse ---
+  if (reverse > 50) {
+    digitalWrite(REVERSE_PIN, HIGH);
+    int rawRev = map(reverse, 0, 1023, 0, reversePWM);
+    targetPWM = -rawRev;
+  }
+  else {
+    digitalWrite(REVERSE_PIN, LOW);
+    int raw = map(forward, 0, 1023, 0, 255);
+    int limit = gearPWMs[gear];
+    if (raw > limit) raw = limit;
+    if (handbrake) raw = 0;
+    targetPWM = raw;
+  }
+
+  // --- Ramping ---
+  if (abs(targetPWM) > abs(currentPWM))
+    currentPWM += (targetPWM - currentPWM) * rampUp;
+  else
+    currentPWM += (targetPWM - currentPWM) * rampDown;
+
+  // --- Brake release detection ---
+  bool isR2Pressed = forward > 20;
+  if (isR2Pressed) {
+    wasPressingR2 = true;
+  } else {
+    if (wasPressingR2) {
+      if (abs(currentPWM) > 10) {
+        brakeHoldUntil = millis() + brakeHoldDuration;
+      }
+      wasPressingR2 = false;
+    }
+  }
+
+  // brake light logic
+  if (millis() < brakeHoldUntil) {
+    analogWrite(BRAKE_PIN, brakeHighPWM);
+  } else {
+    if (headlightsOn)
+      analogWrite(BRAKE_PIN, brakeLowPWM);
+    else
+      analogWrite(BRAKE_PIN, 0);
+  }
+
+  // --- Apply motor PWM ---
+  if (currentPWM > 10) {
+    analogWrite(R_PWM, currentPWM);
+    analogWrite(L_PWM, 0);
+  }
+  else if (currentPWM < -10) {
+    analogWrite(L_PWM, abs(currentPWM));
+    analogWrite(R_PWM, 0);
+  }
+  else {
+    analogWrite(L_PWM, 0);
+    analogWrite(R_PWM, 0);
+  }
+}
+
+// ========================================================
+// GEARS
+// ========================================================
+void handleGears(GamepadPtr gp) {
+  bool up   = gp->buttons() & 0x0004; // square
+  bool down = gp->buttons() & 0x0001; // X
+
+  if (up && !lastUp) {
+    if (gear < 5) gear++;
+  }
+  if (down && !lastDown) {
+    if (gear > 0) gear--;
+  }
+
+  lastUp = up;
+  lastDown = down;
+}
+
+// ========================================================
+// SPORT MODE
+// ========================================================
+void handlePS(GamepadPtr gp) {
+  bool ps = gp->miscButtons() & 0x01;
+
+  if (ps && !lastPS) {
+    sportMode = !sportMode;
+
+    if (sportMode) {
+      rampUp = rampUp_sport;
+      rampDown = rampDown_sport;
+    } else {
+      rampUp = rampUp_normal;
+      rampDown = rampDown_normal;
+      gp->setColorLED(0, 0, 255);
+    }
+  }
+
+  lastPS = ps;
+}
+
+// ========================================================
+// SETUP
+// ========================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SPEAKER_PIN, OUTPUT);
+
+  pinMode(STEER_IN1, OUTPUT);
+  pinMode(STEER_IN2, OUTPUT);
+
+  pinMode(R_PWM, OUTPUT);
+  pinMode(L_PWM, OUTPUT);
+  pinMode(R_EN, OUTPUT);
+  pinMode(L_EN, OUTPUT);
+
+  pinMode(HEADLIGHT_PIN, OUTPUT);
+  pinMode(FOG_PIN, OUTPUT);
+  pinMode(BRAKE_PIN, OUTPUT);
+  pinMode(REVERSE_PIN, OUTPUT);
+
+  digitalWrite(R_EN, HIGH);
+  digitalWrite(L_EN, HIGH);
+
+  BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
+  BP32.forgetBluetoothKeys();
+
+  playBoot();
+}
+
+// ========================================================
+// LOOP
+// ========================================================
+void loop() {
+  BP32.update();
+
+  if (myGamepad && myGamepad->isConnected()) {
+    handlePS(myGamepad);
+    updateSportLED(myGamepad);
+    handleSteering(myGamepad->axisX());
+    handleLights(myGamepad);
+    handleDrive(myGamepad);
+    handleGears(myGamepad);
+  }
+
+  delay(5);
+}
