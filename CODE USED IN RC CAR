@@ -1,4 +1,5 @@
 #include <Bluepad32.h>
+#include "esp_task_wdt.h"
 
 // ========================================================
 // CONFIG
@@ -21,8 +22,12 @@ const int reversePWM = 140;
 float rampUp_normal = 0.15;
 float rampDown_normal = 0.20;
 
-float rampUp_sport = 0.45;
-float rampDown_sport = 0.45;
+float rampUp_sport = 0.6;
+float rampDown_sport = 0.7;
+
+// Steering deadzone (increase = less sensitive)
+const int STEER_DEADZONE = 70;   // try 50–80
+
 
 // ========================================================
 // PIN SETUP
@@ -50,6 +55,13 @@ int headlightLowPWM = 120;
 int headlightHighPWM = 255;
 int brakeLowPWM = 120;
 int brakeHighPWM = 255;
+
+// ========================================================
+// FAILSAFE
+// ========================================================
+unsigned long lastGamepadUpdate = 0;
+const unsigned long FAILSAFE_TIMEOUT = 1000; // ms
+bool failsafeActive = false;                 // 🔴 LATCH
 
 // ========================================================
 // AUDIO
@@ -121,6 +133,8 @@ const unsigned long brakeHoldDuration = 200; // ms
 // ========================================================
 void onConnectedGamepad(GamepadPtr gp) {
   myGamepad = gp;
+  lastGamepadUpdate = millis();
+  failsafeActive = false;   // allow control on fresh connect
   Serial.println("Gamepad connected!");
   playConnect();
   gp->setColorLED(0, 0, 255);
@@ -128,8 +142,24 @@ void onConnectedGamepad(GamepadPtr gp) {
 
 void onDisconnectedGamepad(GamepadPtr gp) {
   myGamepad = nullptr;
+  failsafeActive = true;    // force stop on disconnect
+  failsafeStop();
   Serial.println("Gamepad disconnected!");
   playDisconnect();
+}
+
+// ========================================================
+// FAILSAFE STOP
+// ========================================================
+void failsafeStop() {
+  analogWrite(R_PWM, 0);
+  analogWrite(L_PWM, 0);
+  currentPWM = 0;
+
+  digitalWrite(STEER_IN1, LOW);
+  digitalWrite(STEER_IN2, LOW);
+
+  digitalWrite(REVERSE_PIN, LOW);
 }
 
 // ========================================================
@@ -166,17 +196,19 @@ void updateSportLED(GamepadPtr gp) {
 void handleSteering(int axisX) {
   int steer = map(axisX, -512, 512, -255, 255);
 
-  if (steer > 20) {
+  if (abs(steer) < STEER_DEADZONE) {
+    digitalWrite(STEER_IN1, LOW);
+    digitalWrite(STEER_IN2, LOW);
+    return;
+  }
+
+  if (steer > 0) {
     digitalWrite(STEER_IN1, HIGH);
     digitalWrite(STEER_IN2, LOW);
   }
-  else if (steer < -20) {
-    digitalWrite(STEER_IN1, LOW);
-    digitalWrite(STEER_IN2, HIGH);
-  }
   else {
     digitalWrite(STEER_IN1, LOW);
-    digitalWrite(STEER_IN2, LOW);
+    digitalWrite(STEER_IN2, HIGH);
   }
 }
 
@@ -184,7 +216,6 @@ void handleSteering(int axisX) {
 // HEADLIGHT / FOG / BRAKE / FLASH
 // ========================================================
 void handleLights(GamepadPtr gp) {
-  // TRIANGLE = toggle headlights
   bool triangle = gp->buttons() & 0x0008;
 
   static bool lastTriangle = false;
@@ -201,11 +232,9 @@ void handleLights(GamepadPtr gp) {
   }
   lastTriangle = triangle;
 
-  // R1 = flash high beams (mask 0x0020)
   bool r1 = gp->buttons() & 0x0020;
   flashing = r1;
 
-  // DPAD UP double press (0x01)
   bool dpadUp = (gp->dpad() & 0x01) != 0;
   if (dpadUp && !lastDpadUpState) {
     unsigned long now = millis();
@@ -224,17 +253,19 @@ void handleLights(GamepadPtr gp) {
   }
   lastDpadUpState = dpadUp;
 
-  // Headlights output
-  if (!headlightsOn)
+  if (flashing) {
+    analogWrite(HEADLIGHT_PIN, headlightHighPWM);
+  }
+  else if (!headlightsOn) {
     analogWrite(HEADLIGHT_PIN, 0);
-  else if (flashing)
+  }
+  else if (highBeams) {
     analogWrite(HEADLIGHT_PIN, headlightHighPWM);
-  else if (highBeams)
-    analogWrite(HEADLIGHT_PIN, headlightHighPWM);
-  else
+  }
+  else {
     analogWrite(HEADLIGHT_PIN, headlightLowPWM);
+  }
 
-  // Fog lights
   analogWrite(FOG_PIN, fogOn ? 255 : 0);
 }
 
@@ -242,17 +273,12 @@ void handleLights(GamepadPtr gp) {
 // DRIVE SYSTEM
 // ========================================================
 void handleDrive(GamepadPtr gp) {
-
-
-  int forward = gp->throttle();  // L2 now forward
-  int reverse = gp->brake();     // R2 now reverse
-  // ------------------------------------------------------
+  int forward = gp->throttle();
+  int reverse = gp->brake();
 
   int handbrake = gp->buttons() & 0x0002;
-
   int targetPWM = 0;
 
-  // --- Reverse ---
   if (reverse > 50) {
     digitalWrite(REVERSE_PIN, HIGH);
     int rawRev = map(reverse, 0, 1023, 0, reversePWM);
@@ -267,13 +293,11 @@ void handleDrive(GamepadPtr gp) {
     targetPWM = raw;
   }
 
-  // --- Ramping ---
   if (abs(targetPWM) > abs(currentPWM))
     currentPWM += (targetPWM - currentPWM) * rampUp;
   else
     currentPWM += (targetPWM - currentPWM) * rampDown;
 
-  // --- Brake release detection ---
   bool isR2Pressed = forward > 20;
   if (isR2Pressed) {
     wasPressingR2 = true;
@@ -286,7 +310,6 @@ void handleDrive(GamepadPtr gp) {
     }
   }
 
-  // brake light logic
   if (millis() < brakeHoldUntil) {
     analogWrite(BRAKE_PIN, brakeHighPWM);
   } else {
@@ -296,7 +319,6 @@ void handleDrive(GamepadPtr gp) {
       analogWrite(BRAKE_PIN, 0);
   }
 
-  // --- Apply motor PWM ---
   if (currentPWM > 10) {
     analogWrite(R_PWM, currentPWM);
     analogWrite(L_PWM, 0);
@@ -315,8 +337,8 @@ void handleDrive(GamepadPtr gp) {
 // GEARS
 // ========================================================
 void handleGears(GamepadPtr gp) {
-  bool up   = gp->buttons() & 0x0004; // square
-  bool down = gp->buttons() & 0x0001; // X
+  bool up   = gp->buttons() & 0x0004;
+  bool down = gp->buttons() & 0x0001;
 
   if (up && !lastUp) {
     if (gear < 5) gear++;
@@ -378,6 +400,9 @@ void setup() {
   BP32.setup(&onConnectedGamepad, &onDisconnectedGamepad);
   BP32.forgetBluetoothKeys();
 
+  esp_task_wdt_init(2, true);
+  esp_task_wdt_add(NULL);
+
   playBoot();
 }
 
@@ -385,9 +410,35 @@ void setup() {
 // LOOP
 // ========================================================
 void loop() {
+  esp_task_wdt_reset();
   BP32.update();
 
+  // ENTER FAILSAFE
+  if (!failsafeActive && millis() - lastGamepadUpdate > FAILSAFE_TIMEOUT) {
+    failsafeActive = true;
+    failsafeStop();
+  }
+
+  // FAILSAFE MODE
+  if (failsafeActive) {
+    failsafeStop();
+
+    // Re-arm only when neutral
+    if (myGamepad && myGamepad->isConnected()) {
+      if (myGamepad->throttle() < 20 && myGamepad->brake() < 20) {
+        failsafeActive = false;
+        lastGamepadUpdate = millis();
+      }
+    }
+
+    delay(5);
+    return;
+  }
+
+  // NORMAL OPERATION
   if (myGamepad && myGamepad->isConnected()) {
+    lastGamepadUpdate = millis();
+
     handlePS(myGamepad);
     updateSportLED(myGamepad);
     handleSteering(myGamepad->axisX());
